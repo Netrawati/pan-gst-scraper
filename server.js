@@ -12,9 +12,10 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Ensure uploads and outputs folders exist
-const UPLOADS_DIR = path.join(__dirname, 'uploads');
-const OUTPUTS_DIR = path.join(__dirname, 'outputs');
+// Ensure uploads and outputs folders exist (using /tmp on serverless environments like Vercel)
+const isServerless = process.env.VERCEL || process.env.NOW_BUILDER;
+const UPLOADS_DIR = isServerless ? '/tmp/uploads' : path.join(__dirname, 'uploads');
+const OUTPUTS_DIR = isServerless ? '/tmp/outputs' : path.join(__dirname, 'outputs');
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 if (!fs.existsSync(OUTPUTS_DIR)) fs.mkdirSync(OUTPUTS_DIR, { recursive: true });
 
