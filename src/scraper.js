@@ -13,7 +13,7 @@ function cleanText(text) {
 }
 
 /**
- * Puppeteer scraping logic for a single PAN number.
+ * Puppeteer scraping logic for a single PAN number (re-using the page session).
  * @param {object} page Puppeteer Page instance
  * @param {string} pan 
  * @param {function} logCallback Real-time logger callback
@@ -21,31 +21,32 @@ function cleanText(text) {
  */
 async function scrapePanDetails(page, pan, logCallback) {
   const cleanPan = pan.trim().toUpperCase();
-  logCallback(`[PROCESS] Querying PAN: ${cleanPan}...`);
+  logCallback(`Querying PAN: ${cleanPan}...`);
   
   if (!PAN_REGEX.test(cleanPan)) {
-    logCallback(`[WARNING] Invalid PAN format: ${cleanPan}. Skipping scraping.`);
+    logCallback(`[WARNING] Invalid PAN format: ${cleanPan}. Skipping.`);
     return {
       gstin: 'N/A',
       businessName: 'N/A',
       gstStatus: 'N/A',
-      scrapeStatus: 'Invalid PAN Format'
+      scrapeStatus: 'Invalid PAN Format',
+      gstDetailsList: []
     };
   }
 
   try {
-    // Navigate to the Razorpay GST PAN search page
-    logCallback(`[DEBUG] Navigating to page for PAN: ${cleanPan}`);
-    await page.goto('https://razorpay.com/gst-number-search/pan/', {
-      waitUntil: 'networkidle2',
-      timeout: 30000
-    });
+    // 1. Ensure the browser is on the search page
+    const currentUrl = page.url();
+    if (!currentUrl || !currentUrl.includes('razorpay.com/gst-number-search/pan/')) {
+      logCallback(`[DEBUG] Initial page navigation for worker...`);
+      await page.goto('https://razorpay.com/gst-number-search/pan/', {
+        waitUntil: 'networkidle2',
+        timeout: 30000
+      });
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
 
-    // Wait a brief moment to let React render
-    await new Promise(resolve => setTimeout(resolve, 2000));
-
-    // Find the PAN input field
-    // Try multiple selectors including the exact ones discovered
+    // 2. Locate the PAN input field
     const inputSelectors = [
       'input[placeholder="DWWPB9503H"]',
       '.chakra-input',
@@ -63,26 +64,36 @@ async function scrapePanDetails(page, pan, logCallback) {
             const style = window.getComputedStyle(el);
             return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetHeight > 0;
           }, inputField);
-          if (isVisible) {
-            logCallback(`[DEBUG] Found input with selector: ${selector}`);
-            break;
-          }
+          if (isVisible) break;
         }
-      } catch (err) {
-        // Suppress and continue
-      }
+      } catch (err) {}
     }
 
     if (!inputField) {
-      throw new Error("Could not locate any valid, visible PAN input field on the page.");
+      logCallback(`[WARNING] Input field missing. Reloading search page...`);
+      await page.goto('https://razorpay.com/gst-number-search/pan/', {
+        waitUntil: 'networkidle2',
+        timeout: 30000
+      });
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      for (const selector of inputSelectors) {
+        try {
+          inputField = await page.$(selector);
+          if (inputField) break;
+        } catch (e) {}
+      }
+      if (!inputField) {
+        throw new Error("Could not locate any valid, visible PAN input field.");
+      }
     }
 
-    // Select all text in input and delete before typing
+    // 3. Clear existing input and type the new PAN
     await inputField.click({ clickCount: 3 });
     await page.keyboard.press('Backspace');
-    await inputField.type(cleanPan, { delay: 50 });
+    await page.evaluate(el => el.value = '', inputField); // Hard clear in DOM
+    await inputField.type(cleanPan, { delay: 30 });
     
-    // Find the submit/search button
+    // 4. Locate the search/submit button
     const buttonSelectors = [
       '.css-eo7rsn',
       'button[type="submit"]',
@@ -102,7 +113,6 @@ async function scrapePanDetails(page, pan, logCallback) {
           }, textToMatch);
           if (searchButton && searchButton.asElement()) {
             searchButton = searchButton.asElement();
-            logCallback(`[DEBUG] Found button matching text: ${textToMatch}`);
             break;
           }
         } else {
@@ -112,33 +122,26 @@ async function scrapePanDetails(page, pan, logCallback) {
               const style = window.getComputedStyle(el);
               return style.display !== 'none' && style.visibility !== 'hidden';
             }, searchButton);
-            if (isVisible) {
-              logCallback(`[DEBUG] Found button with selector: ${selector}`);
-              break;
-            }
+            if (isVisible) break;
           }
         }
-      } catch (err) {
-        // Suppress and continue
-      }
+      } catch (err) {}
     }
 
     if (!searchButton) {
       throw new Error("Could not locate the search/submit button.");
     }
 
-    // Click and wait for search to complete
+    // 5. Submit the search
     await searchButton.click();
-    logCallback(`[DEBUG] Submitted search. Waiting for results to load...`);
     
-    // Wait for either results or "No records found" / error elements
-    // Let's sleep for 4 seconds to let the search run dynamically
-    await new Promise(resolve => setTimeout(resolve, 4000));
-
-    // Extract page body text to inspect for results
-    const pageText = await page.evaluate(() => document.body.innerText);
+    // 6. Dynamic Result Wait (Polling every 500ms for up to 5 seconds)
+    const maxPollTime = 5000;
+    const pollInterval = 500;
+    let elapsed = 0;
+    let pageText = '';
+    let hasResultLoaded = false;
     
-    // Check if there's an explicit "No records found" or similar message
     const noResultsPhrases = [
       'no details found', 
       'no records found', 
@@ -148,59 +151,158 @@ async function scrapePanDetails(page, pan, logCallback) {
       'does not exist', 
       'could not find any records'
     ];
+
+    while (elapsed < maxPollTime) {
+      await new Promise(resolve => setTimeout(resolve, pollInterval));
+      elapsed += pollInterval;
+      
+      pageText = await page.evaluate(() => document.body.innerText);
+      
+      const containsPan = pageText.toUpperCase().includes(cleanPan);
+      const containsNoResult = noResultsPhrases.some(phrase => pageText.toLowerCase().includes(phrase));
+      
+      if (containsPan || containsNoResult) {
+        hasResultLoaded = true;
+        break;
+      }
+    }
+
+    if (!hasResultLoaded) {
+      logCallback(`[DEBUG] Waiting 2 additional seconds for slow network rendering...`);
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      pageText = await page.evaluate(() => document.body.innerText);
+    }
+
+    // 7. Check if explicit "No records found" or equivalent is displayed
     const hasNoResults = noResultsPhrases.some(phrase => pageText.toLowerCase().includes(phrase));
-    
     if (hasNoResults) {
       logCallback(`[INFO] No GST registration associated with PAN: ${cleanPan}`);
       return {
         gstin: 'N/A',
         businessName: 'No Business Registered',
         gstStatus: 'N/A',
-        scrapeStatus: 'No GST Associated'
+        scrapeStatus: 'No GST Associated',
+        gstDetailsList: []
       };
     }
 
-    // Let's parse the body text for GSTINs using regex
-    let foundGstins = pageText.match(GSTIN_REGEX);
-    
-    if (!foundGstins || foundGstins.length === 0) {
-      // Maybe there are no GSTINs, or they haven't loaded yet.
-      logCallback(`[DEBUG] GSTIN not found in body text yet. Waiting 2 more seconds...`);
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      const secondPageText = await page.evaluate(() => document.body.innerText);
-      foundGstins = secondPageText.match(GSTIN_REGEX);
+    // 8. Extract GSTINs and their statuses from the DOM table/page
+    const gstDetailsList = await page.evaluate(() => {
+      const gstinRegex = /[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}/i;
+      const rows = Array.from(document.querySelectorAll('tr, [role="row"]'));
+      const results = [];
       
-      if (!foundGstins || foundGstins.length === 0) {
-        // If we still didn't find GSTINs, but we didn't find "No records found" either, check if there is text indicating a block or rate limit
-        if (secondPageText.toLowerCase().includes('captcha') || secondPageText.toLowerCase().includes('robot') || secondPageText.toLowerCase().includes('human')) {
-          logCallback(`[WARNING] Scraping was blocked by a CAPTCHA or Anti-Bot challenge.`);
-          return {
-            gstin: 'N/A',
-            businessName: 'Verification Required',
-            gstStatus: 'Blocked',
-            scrapeStatus: 'CAPTCHA Triggered'
-          };
+      for (const row of rows) {
+        const cells = Array.from(row.querySelectorAll('td, [role="gridcell"], div'));
+        let foundGstin = null;
+        let foundStatus = null;
+        
+        for (const cell of cells) {
+          const txt = (cell.innerText || '').trim();
+          if (gstinRegex.test(txt)) {
+            foundGstin = txt.match(gstinRegex)[0].toUpperCase();
+          }
+          const lowerTxt = txt.toLowerCase();
+          if (lowerTxt === 'active' || lowerTxt === 'inactive' || lowerTxt === 'cancelled' || lowerTxt === 'suspended') {
+            foundStatus = txt;
+          }
         }
         
-        logCallback(`[INFO] No GST details found or visible on page for PAN: ${cleanPan}`);
-        return {
-          gstin: 'N/A',
-          businessName: 'Not Found',
-          gstStatus: 'N/A',
-          scrapeStatus: 'No GST Details Found'
-        };
+        if (foundGstin) {
+          if (!foundStatus) {
+            const rowText = (row.innerText || '').toLowerCase();
+            const statusWords = ['active', 'inactive', 'cancelled', 'suspended'];
+            const matched = statusWords.find(w => rowText.includes(w));
+            if (matched) {
+              foundStatus = matched.charAt(0).toUpperCase() + matched.slice(1);
+            }
+          }
+          
+          results.push({
+            gstin: foundGstin,
+            status: foundStatus || 'Active'
+          });
+        }
+      }
+      
+      if (results.length === 0) {
+        const allElements = Array.from(document.querySelectorAll('a, p, span, td, div'));
+        const seenGstins = new Set();
+        
+        for (const el of allElements) {
+          const txt = (el.innerText || '').trim();
+          if (gstinRegex.test(txt)) {
+            const gstin = txt.match(gstinRegex)[0].toUpperCase();
+            if (!seenGstins.has(gstin)) {
+              seenGstins.add(gstin);
+              
+              let status = 'Active';
+              let parent = el.parentElement;
+              let depth = 0;
+              
+              while (parent && depth < 3) {
+                const parentText = (parent.innerText || '').toLowerCase();
+                const statusWords = ['active', 'inactive', 'cancelled', 'suspended'];
+                const matched = statusWords.find(w => parentText.includes(w));
+                if (matched) {
+                  status = matched.charAt(0).toUpperCase() + matched.slice(1);
+                  break;
+                }
+                parent = parent.parentElement;
+                depth++;
+              }
+              
+              results.push({ gstin, status });
+            }
+          }
+        }
+      }
+      
+      return results;
+    });
+
+    let uniqueGstins = [];
+    if (gstDetailsList && gstDetailsList.length > 0) {
+      uniqueGstins = gstDetailsList.map(item => item.gstin);
+    } else {
+      let foundGstins = pageText.match(GSTIN_REGEX);
+      if (foundGstins) {
+        uniqueGstins = Array.from(new Set(foundGstins)).map(g => g.toUpperCase());
+        uniqueGstins.forEach(gstin => {
+          gstDetailsList.push({ gstin, status: 'Active' });
+        });
       }
     }
 
-    // We found one or more GSTINs!
-    const uniqueGstins = Array.from(new Set(foundGstins)).map(g => g.toUpperCase());
+    if (uniqueGstins.length === 0) {
+      // Check for CAPTCHA/Anti-Bot Block
+      if (pageText.toLowerCase().includes('captcha') || pageText.toLowerCase().includes('robot') || pageText.toLowerCase().includes('human')) {
+        logCallback(`[WARNING] CAPTCHA / Anti-Bot block detected for PAN: ${cleanPan}`);
+        return {
+          gstin: 'N/A',
+          businessName: 'Verification Required',
+          gstStatus: 'Blocked',
+          scrapeStatus: 'CAPTCHA Triggered',
+          gstDetailsList: []
+        };
+      }
+      
+      logCallback(`[INFO] No GST details visible for PAN: ${cleanPan}`);
+      return {
+        gstin: 'N/A',
+        businessName: 'Not Found',
+        gstStatus: 'N/A',
+        scrapeStatus: 'No GST Details Found',
+        gstDetailsList: []
+      };
+    }
+
     logCallback(`[SUCCESS] Found ${uniqueGstins.length} GSTIN(s) for PAN ${cleanPan}: ${uniqueGstins.join(', ')}`);
 
-    // Let's extract the details associated with the first GSTIN (or compile all of them)
+    // 9. Extract and parse Business Name & Status
     let businessName = 'N/A';
     let gstStatus = 'N/A';
 
-    // Parse business name
     const nameMatches = [
       /Business Name\s*[:|-]?\s*([^\n\r]+)/i,
       /Legal Name of Business\s*[:|-]?\s*([^\n\r]+)/i,
@@ -219,7 +321,6 @@ async function scrapePanDetails(page, pan, logCallback) {
       }
     }
 
-    // Parse GST Status
     const statusMatches = [
       /GSTIN Status\s*[:|-]?\s*([^\n\r]+)/i,
       /GST Status\s*[:|-]?\s*([^\n\r]+)/i,
@@ -237,8 +338,6 @@ async function scrapePanDetails(page, pan, logCallback) {
       }
     }
 
-    // Fallback if status or name not found through regex: 
-    // Scan DOM elements that contain the values
     if (businessName === 'N/A' || gstStatus === 'N/A') {
       const domDetails = await page.evaluate(() => {
         const items = Array.from(document.querySelectorAll('div, p, td, span, li'));
@@ -273,7 +372,6 @@ async function scrapePanDetails(page, pan, logCallback) {
       }
     }
 
-    // Clean up status (remove junk words)
     if (gstStatus !== 'N/A') {
       const statusWords = ['active', 'inactive', 'cancelled', 'suspended', 'pending'];
       const matchedWord = statusWords.find(w => gstStatus.toLowerCase().includes(w));
@@ -282,37 +380,33 @@ async function scrapePanDetails(page, pan, logCallback) {
       }
     }
 
-    // Return successfully scraped details
     return {
       gstin: uniqueGstins.join(', '),
       businessName: businessName !== 'N/A' ? businessName : 'Registered Entity',
       gstStatus: gstStatus !== 'N/A' ? gstStatus : 'Active',
-      scrapeStatus: 'Success'
+      scrapeStatus: 'Success',
+      gstDetailsList: gstDetailsList
     };
 
   } catch (error) {
-    logCallback(`[ERROR] Scraping failed for PAN ${cleanPan}: ${error.message}`);
-    return {
-      gstin: 'N/A',
-      businessName: 'N/A',
-      gstStatus: 'N/A',
-      scrapeStatus: `Error: ${error.message}`
-    };
+    logCallback(`[ERROR] Scraping failed: ${error.message}`);
+    throw error; // Let the concurrent manager handle retry and page refresh
   }
 }
 
 /**
- * Bulk scrapes an array of PAN numbers.
+ * Bulk scrapes an array of PAN numbers using high-speed parallel worker tabs.
  * @param {Array} pans List of PAN numbers
  * @param {function} progressCallback Callback to stream live progress percentage and log strings
  * @param {boolean} headless Whether to run browser headlessly
+ * @param {number} concurrency Number of parallel worker tabs (default = 3)
  * @returns {object} Map of PAN -> results
  */
-async function scrapeBulkPans(pans, progressCallback, headless = true) {
-  progressCallback(0, `[INIT] Starting Puppeteer browser session...`);
+async function scrapeBulkPans(pans, progressCallback, headless = true, concurrency = 3) {
+  progressCallback(0, `[INIT] Starting Puppeteer browser session with ${concurrency} parallel workers...`);
   
   const launchOptions = {
-    headless: headless ? 'shell' : false, // Puppeteer headless shell mode is fast and robust
+    headless: headless ? 'shell' : false,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -327,53 +421,140 @@ async function scrapeBulkPans(pans, progressCallback, headless = true) {
   }
 
   const browser = await puppeteer.launch(launchOptions);
-
   const results = {};
   const total = pans.length;
+  let completedCount = 0;
+  
+  // Create shared queue containing the array indices
+  const queue = [...pans.keys()];
 
-  try {
-    const page = await browser.newPage();
+  // Worker loop
+  const runWorker = async (workerId) => {
+    progressCallback(0, `[Worker-${workerId}] Initializing worker tab...`);
+    let page = await browser.newPage();
     
-    // Emulate human headers and settings
-    await page.setViewport({ width: 1280, height: 800 });
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    
-    // Hide webdriver footprint
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    });
+    const initPage = async (p) => {
+      await p.setViewport({ width: 1280, height: 800 });
+      await p.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+      await p.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      });
+    };
 
-    for (let i = 0; i < total; i++) {
-      const rawPan = pans[i];
+    await initPage(page);
+    let processedCount = 0;
+
+    while (queue.length > 0) {
+      const index = queue.shift();
+      if (index === undefined) break;
+
+      const rawPan = pans[index];
       const pan = String(rawPan || '').trim().toUpperCase();
-      
+
       if (!pan) {
+        completedCount++;
         continue;
       }
 
-      // Live progress callback
-      const currentProgress = Math.round(((i) / total) * 100);
+      // Session recycling: recreate page every 50 PANs to manage memory and session cookies
+      if (processedCount > 0 && processedCount % 50 === 0) {
+        progressCallback(
+          Math.round((completedCount / total) * 100),
+          `[Worker-${workerId}] Recycling page tab session to maintain clean state...`
+        );
+        try {
+          await page.close();
+        } catch (e) {}
+        page = await browser.newPage();
+        await initPage(page);
+      }
+
+      const currentProgress = Math.round((completedCount / total) * 100);
       progressCallback(
         currentProgress,
-        `[PROGRESS] Scraped ${i}/${total} PANs. Current active item: ${pan}`
+        `[Worker-${workerId}] [${completedCount + 1}/${total}] Querying PAN: ${pan}`
       );
 
-      // Scrape individual PAN
-      const panResult = await scrapePanDetails(page, pan, (msg) => {
-        progressCallback(currentProgress, msg);
-      });
+      let panResult = null;
+      let retries = 2; // Retry up to 2 times on failures
+
+      while (retries >= 0) {
+        try {
+          panResult = await scrapePanDetails(page, pan, (msg) => {
+            progressCallback(currentProgress, `[Worker-${workerId}] ${msg}`);
+          });
+
+          // If blocked by CAPTCHA, trigger immediate session recycling for next item
+          if (panResult.scrapeStatus === 'CAPTCHA Triggered') {
+            progressCallback(
+              currentProgress,
+              `[Worker-${workerId}] [WARNING] Blocked by CAPTCHA. Flagging for session recycle...`
+            );
+            processedCount = 50; 
+          }
+          break;
+        } catch (error) {
+          progressCallback(
+            currentProgress,
+            `[Worker-${workerId}] [ERROR] Attempt failed for ${pan}: ${error.message}. Retries left: ${retries}`
+          );
+          retries--;
+          
+          if (retries >= 0) {
+            // Re-create the page tab to heal the session
+            try {
+              await page.close();
+            } catch (e) {}
+            page = await browser.newPage();
+            await initPage(page);
+            await new Promise(resolve => setTimeout(resolve, 3000));
+          } else {
+            panResult = {
+              gstin: 'N/A',
+              businessName: 'N/A',
+              gstStatus: 'N/A',
+              scrapeStatus: `Failed: ${error.message}`
+            };
+          }
+        }
+      }
 
       results[pan] = panResult;
+      completedCount++;
+      processedCount++;
 
-      // Add a polite random delay between 2 to 4 seconds to prevent rate-blocking
-      if (i < total - 1) {
-        const delay = Math.floor(Math.random() * 2000) + 2000;
-        progressCallback(currentProgress, `[DEBUG] Sleeping for ${(delay / 1000).toFixed(1)} seconds to emulate human behavior...`);
+      // Progress reporting
+      const finalProgress = Math.round((completedCount / total) * 100);
+      progressCallback(
+        finalProgress,
+        `[Worker-${workerId}] Completed item ${pan}. Total completed: ${completedCount}/${total}`
+      );
+
+      // Add a polite human-like delay between searches
+      if (queue.length > 0) {
+        const delay = Math.floor(Math.random() * 1500) + 1500; // 1.5s to 3s
         await new Promise(resolve => setTimeout(resolve, delay));
       }
     }
 
-    // Final completion callback
+    try {
+      await page.close();
+    } catch (e) {}
+    progressCallback(
+      Math.round((completedCount / total) * 100),
+      `[Worker-${workerId}] Worker finished.`
+    );
+  };
+
+  try {
+    // Launch parallel workers
+    const workers = [];
+    for (let w = 1; w <= concurrency; w++) {
+      workers.push(runWorker(w));
+    }
+
+    // Wait for all workers to finish their queues
+    await Promise.all(workers);
     progressCallback(100, `[COMPLETED] Successfully completed processing all ${total} PAN(s).`);
 
   } catch (error) {
@@ -381,7 +562,7 @@ async function scrapeBulkPans(pans, progressCallback, headless = true) {
     console.error("Critical scrape bulk error:", error);
   } finally {
     await browser.close();
-    progressCallback(100, `[CLOSE] Browser closed successfully.`);
+    progressCallback(100, `[CLOSE] Puppeteer browser closed successfully.`);
   }
 
   return results;
@@ -390,3 +571,4 @@ async function scrapeBulkPans(pans, progressCallback, headless = true) {
 export {
   scrapeBulkPans
 };
+

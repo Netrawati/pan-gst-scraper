@@ -160,13 +160,14 @@ app.post('/process', async (req, res) => {
   logMessage(0, `[PROCESS] Initializing scraping job for ${activeJob.pans.length} PANs...`);
 
   try {
-    // Run Puppeteer scraper bulk processing
+    // Run Puppeteer scraper bulk processing (with 3 parallel workers for high speed)
     const results = await scrapeBulkPans(
       activeJob.pans, 
       (progress, logText) => {
         logMessage(progress, logText);
       },
-      true // headless mode
+      true, // headless mode
+      3 // concurrency level
     );
 
     activeJob.results = results;

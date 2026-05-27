@@ -8,3 +8,5 @@ outputs/*
 *.log
 package-lock.json
 razorpay_loaded.png
+
+.vercel
