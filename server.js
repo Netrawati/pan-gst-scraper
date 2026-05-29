@@ -167,7 +167,7 @@ app.post('/process', async (req, res) => {
         logMessage(progress, logText);
       },
       true, // headless mode
-      3 // concurrency level
+      1 // concurrency level
     );
 
     activeJob.results = results;

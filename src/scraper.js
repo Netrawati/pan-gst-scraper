@@ -2,18 +2,9 @@ import puppeteer from 'puppeteer';
 
 // Indian PAN regex: 5 letters, 4 digits, 1 letter
 const PAN_REGEX = /^[A-Z]{5}[0-9]{4}[A-Z]{1}$/i;
-// Indian GSTIN regex: 2 digits, 5 letters, 4 digits, 1 letter, 1 char, Z, 1 char
-const GSTIN_REGEX = /[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}/gi;
 
 /**
- * Clean text by removing extra spaces and newlines
- */
-function cleanText(text) {
-  return String(text || '').replace(/\s+/g, ' ').trim();
-}
-
-/**
- * Puppeteer scraping logic for a single PAN number (re-using the page session).
+ * Puppeteer scraping logic for a single PAN number using page-context API fetches.
  * @param {object} page Puppeteer Page instance
  * @param {string} pan 
  * @param {function} logCallback Real-time logger callback
@@ -34,368 +25,158 @@ async function scrapePanDetails(page, pan, logCallback) {
     };
   }
 
-  try {
-    // 1. Ensure the browser is on the search page
-    const currentUrl = page.url();
-    if (!currentUrl || !currentUrl.includes('razorpay.com/gst-number-search/pan/')) {
-      logCallback(`[DEBUG] Initial page navigation for worker...`);
-      await page.goto('https://razorpay.com/gst-number-search/pan/', {
-        waitUntil: 'networkidle2',
-        timeout: 30000
-      });
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    }
-
-    // 2. Locate the PAN input field
-    const inputSelectors = [
-      'input[placeholder="DWWPB9503H"]',
-      '.chakra-input',
-      'input[type="text"]',
-      'input[placeholder*="PAN" i]',
-      'input'
-    ];
-    
-    let inputField = null;
-    for (const selector of inputSelectors) {
-      try {
-        inputField = await page.$(selector);
-        if (inputField) {
-          const isVisible = await page.evaluate(el => {
-            const style = window.getComputedStyle(el);
-            return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetHeight > 0;
-          }, inputField);
-          if (isVisible) break;
-        }
-      } catch (err) {}
-    }
-
-    if (!inputField) {
-      logCallback(`[WARNING] Input field missing. Reloading search page...`);
-      await page.goto('https://razorpay.com/gst-number-search/pan/', {
-        waitUntil: 'networkidle2',
-        timeout: 30000
-      });
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      for (const selector of inputSelectors) {
-        try {
-          inputField = await page.$(selector);
-          if (inputField) break;
-        } catch (e) {}
-      }
-      if (!inputField) {
-        throw new Error("Could not locate any valid, visible PAN input field.");
-      }
-    }
-
-    // 3. Clear existing input and type the new PAN
-    await inputField.click({ clickCount: 3 });
-    await page.keyboard.press('Backspace');
-    await page.evaluate(el => el.value = '', inputField); // Hard clear in DOM
-    await inputField.type(cleanPan, { delay: 30 });
-    
-    // 4. Locate the search/submit button
-    const buttonSelectors = [
-      '.css-eo7rsn',
-      'button[type="submit"]',
-      'button:has-text("Search")',
-      'form button',
-      'button'
-    ];
-
-    let searchButton = null;
-    for (const selector of buttonSelectors) {
-      try {
-        if (selector.includes(':has-text')) {
-          const textToMatch = selector.match(/"([^"]+)"/)[1];
-          searchButton = await page.evaluateHandle((text) => {
-            const btns = Array.from(document.querySelectorAll('button'));
-            return btns.find(b => (b.innerText || '').toLowerCase().includes(text.toLowerCase()));
-          }, textToMatch);
-          if (searchButton && searchButton.asElement()) {
-            searchButton = searchButton.asElement();
-            break;
-          }
-        } else {
-          searchButton = await page.$(selector);
-          if (searchButton) {
-            const isVisible = await page.evaluate(el => {
-              const style = window.getComputedStyle(el);
-              return style.display !== 'none' && style.visibility !== 'hidden';
-            }, searchButton);
-            if (isVisible) break;
-          }
-        }
-      } catch (err) {}
-    }
-
-    if (!searchButton) {
-      throw new Error("Could not locate the search/submit button.");
-    }
-
-    // 5. Submit the search
-    await searchButton.click();
-    
-    // 6. Dynamic Result Wait (Polling every 500ms for up to 5 seconds)
-    const maxPollTime = 5000;
-    const pollInterval = 500;
-    let elapsed = 0;
-    let pageText = '';
-    let hasResultLoaded = false;
-    
-    const noResultsPhrases = [
-      'no details found', 
-      'no records found', 
-      'no gstin associated', 
-      'invalid pan', 
-      'no data found', 
-      'does not exist', 
-      'could not find any records'
-    ];
-
-    while (elapsed < maxPollTime) {
-      await new Promise(resolve => setTimeout(resolve, pollInterval));
-      elapsed += pollInterval;
-      
-      pageText = await page.evaluate(() => document.body.innerText);
-      
-      const containsPan = pageText.toUpperCase().includes(cleanPan);
-      const containsNoResult = noResultsPhrases.some(phrase => pageText.toLowerCase().includes(phrase));
-      
-      if (containsPan || containsNoResult) {
-        hasResultLoaded = true;
-        break;
-      }
-    }
-
-    if (!hasResultLoaded) {
-      logCallback(`[DEBUG] Waiting 2 additional seconds for slow network rendering...`);
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      pageText = await page.evaluate(() => document.body.innerText);
-    }
-
-    // 7. Check if explicit "No records found" or equivalent is displayed
-    const hasNoResults = noResultsPhrases.some(phrase => pageText.toLowerCase().includes(phrase));
-    if (hasNoResults) {
-      logCallback(`[INFO] No GST registration associated with PAN: ${cleanPan}`);
-      return {
-        gstin: 'N/A',
-        businessName: 'No Business Registered',
-        gstStatus: 'N/A',
-        scrapeStatus: 'No GST Associated',
-        gstDetailsList: []
-      };
-    }
-
-    // 8. Extract GSTINs and their statuses from the DOM table/page
-    const gstDetailsList = await page.evaluate(() => {
-      const gstinRegex = /[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}/i;
-      const rows = Array.from(document.querySelectorAll('tr, [role="row"]'));
-      const results = [];
-      
-      for (const row of rows) {
-        const cells = Array.from(row.querySelectorAll('td, [role="gridcell"], div'));
-        let foundGstin = null;
-        let foundStatus = null;
-        
-        for (const cell of cells) {
-          const txt = (cell.innerText || '').trim();
-          if (gstinRegex.test(txt)) {
-            foundGstin = txt.match(gstinRegex)[0].toUpperCase();
-          }
-          const lowerTxt = txt.toLowerCase();
-          if (lowerTxt === 'active' || lowerTxt === 'inactive' || lowerTxt === 'cancelled' || lowerTxt === 'suspended') {
-            foundStatus = txt;
-          }
-        }
-        
-        if (foundGstin) {
-          if (!foundStatus) {
-            const rowText = (row.innerText || '').toLowerCase();
-            const statusWords = ['active', 'inactive', 'cancelled', 'suspended'];
-            const matched = statusWords.find(w => rowText.includes(w));
-            if (matched) {
-              foundStatus = matched.charAt(0).toUpperCase() + matched.slice(1);
-            }
-          }
-          
-          results.push({
-            gstin: foundGstin,
-            status: foundStatus || 'Active'
-          });
-        }
-      }
-      
-      if (results.length === 0) {
-        const allElements = Array.from(document.querySelectorAll('a, p, span, td, div'));
-        const seenGstins = new Set();
-        
-        for (const el of allElements) {
-          const txt = (el.innerText || '').trim();
-          if (gstinRegex.test(txt)) {
-            const gstin = txt.match(gstinRegex)[0].toUpperCase();
-            if (!seenGstins.has(gstin)) {
-              seenGstins.add(gstin);
-              
-              let status = 'Active';
-              let parent = el.parentElement;
-              let depth = 0;
-              
-              while (parent && depth < 3) {
-                const parentText = (parent.innerText || '').toLowerCase();
-                const statusWords = ['active', 'inactive', 'cancelled', 'suspended'];
-                const matched = statusWords.find(w => parentText.includes(w));
-                if (matched) {
-                  status = matched.charAt(0).toUpperCase() + matched.slice(1);
-                  break;
-                }
-                parent = parent.parentElement;
-                depth++;
-              }
-              
-              results.push({ gstin, status });
-            }
-          }
-        }
-      }
-      
-      return results;
+  // Ensure the page session is established on razorpay origin
+  const currentUrl = page.url();
+  if (!currentUrl || !currentUrl.includes('razorpay.com')) {
+    logCallback(`[DEBUG] Initial page navigation for worker to establish session...`);
+    await page.goto('https://razorpay.com/gst-number-search/pan/', {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000
     });
-
-    let uniqueGstins = [];
-    if (gstDetailsList && gstDetailsList.length > 0) {
-      uniqueGstins = gstDetailsList.map(item => item.gstin);
-    } else {
-      let foundGstins = pageText.match(GSTIN_REGEX);
-      if (foundGstins) {
-        uniqueGstins = Array.from(new Set(foundGstins)).map(g => g.toUpperCase());
-        uniqueGstins.forEach(gstin => {
-          gstDetailsList.push({ gstin, status: 'Active' });
-        });
-      }
-    }
-
-    if (uniqueGstins.length === 0) {
-      // Check for CAPTCHA/Anti-Bot Block
-      if (pageText.toLowerCase().includes('captcha') || pageText.toLowerCase().includes('robot') || pageText.toLowerCase().includes('human')) {
-        logCallback(`[WARNING] CAPTCHA / Anti-Bot block detected for PAN: ${cleanPan}`);
-        return {
-          gstin: 'N/A',
-          businessName: 'Verification Required',
-          gstStatus: 'Blocked',
-          scrapeStatus: 'CAPTCHA Triggered',
-          gstDetailsList: []
-        };
-      }
-      
-      logCallback(`[INFO] No GST details visible for PAN: ${cleanPan}`);
-      return {
-        gstin: 'N/A',
-        businessName: 'Not Found',
-        gstStatus: 'N/A',
-        scrapeStatus: 'No GST Details Found',
-        gstDetailsList: []
-      };
-    }
-
-    logCallback(`[SUCCESS] Found ${uniqueGstins.length} GSTIN(s) for PAN ${cleanPan}: ${uniqueGstins.join(', ')}`);
-
-    // 9. Extract and parse Business Name & Status
-    let businessName = 'N/A';
-    let gstStatus = 'N/A';
-
-    const nameMatches = [
-      /Business Name\s*[:|-]?\s*([^\n\r]+)/i,
-      /Legal Name of Business\s*[:|-]?\s*([^\n\r]+)/i,
-      /Trade Name\s*[:|-]?\s*([^\n\r]+)/i,
-      /Legal Name\s*[:|-]?\s*([^\n\r]+)/i
-    ];
-
-    for (const regex of nameMatches) {
-      const match = pageText.match(regex);
-      if (match && match[1]) {
-        const potentialName = cleanText(match[1]);
-        if (potentialName && potentialName.length > 3 && !potentialName.includes('GSTIN') && !potentialName.includes('Status')) {
-          businessName = potentialName;
-          break;
-        }
-      }
-    }
-
-    const statusMatches = [
-      /GSTIN Status\s*[:|-]?\s*([^\n\r]+)/i,
-      /GST Status\s*[:|-]?\s*([^\n\r]+)/i,
-      /Status\s*[:|-]?\s*([^\n\r]+)/i
-    ];
-
-    for (const regex of statusMatches) {
-      const match = pageText.match(regex);
-      if (match && match[1]) {
-        const potentialStatus = cleanText(match[1]);
-        if (potentialStatus && potentialStatus.length > 2 && potentialStatus.length < 20) {
-          gstStatus = potentialStatus;
-          break;
-        }
-      }
-    }
-
-    if (businessName === 'N/A' || gstStatus === 'N/A') {
-      const domDetails = await page.evaluate(() => {
-        const items = Array.from(document.querySelectorAll('div, p, td, span, li'));
-        let name = null;
-        let stat = null;
-        
-        for (let i = 0; i < items.length; i++) {
-          const txt = items[i].innerText || '';
-          if (txt.includes('Business Name') || txt.includes('Legal Name')) {
-            if (txt.includes(':')) {
-              name = txt.split(':')[1];
-            } else if (items[i].nextElementSibling) {
-              name = items[i].nextElementSibling.innerText;
-            }
-          }
-          if (txt.includes('GSTIN Status') || (txt.includes('Status') && !txt.includes('GSTIN'))) {
-            if (txt.includes(':')) {
-              stat = txt.split(':')[1];
-            } else if (items[i].nextElementSibling) {
-              stat = items[i].nextElementSibling.innerText;
-            }
-          }
-        }
-        return { name, stat };
-      });
-
-      if (businessName === 'N/A' && domDetails.name) {
-        businessName = cleanText(domDetails.name);
-      }
-      if (gstStatus === 'N/A' && domDetails.stat) {
-        gstStatus = cleanText(domDetails.stat);
-      }
-    }
-
-    if (gstStatus !== 'N/A') {
-      const statusWords = ['active', 'inactive', 'cancelled', 'suspended', 'pending'];
-      const matchedWord = statusWords.find(w => gstStatus.toLowerCase().includes(w));
-      if (matchedWord) {
-        gstStatus = matchedWord.charAt(0).toUpperCase() + matchedWord.slice(1);
-      }
-    }
-
-    return {
-      gstin: uniqueGstins.join(', '),
-      businessName: businessName !== 'N/A' ? businessName : 'Registered Entity',
-      gstStatus: gstStatus !== 'N/A' ? gstStatus : 'Active',
-      scrapeStatus: 'Success',
-      gstDetailsList: gstDetailsList
-    };
-
-  } catch (error) {
-    logCallback(`[ERROR] Scraping failed: ${error.message}`);
-    throw error; // Let the concurrent manager handle retry and page refresh
+    // Sleep for 5.0 seconds instead of 2.0 seconds to give Cloudflare challenge scripts
+    // ample time to execute and settle valid session cookies.
+    await new Promise(resolve => setTimeout(resolve, 5000));
   }
+
+  // Fetch GSTIN list for this specific PAN from the direct API in browser context
+  logCallback(`Querying GSTIN list API for PAN: ${cleanPan}...`);
+  const panApiUrl = `https://razorpay.com/api/gstin/pan/${cleanPan}`;
+  
+  let panApiResponse;
+  try {
+    panApiResponse = await page.evaluate(async (url) => {
+      try {
+        const res = await fetch(url);
+        if (res.status === 429) {
+          return { errorStatus: 429 };
+        }
+        if (!res.ok) {
+          return { errorStatus: res.status, errorText: res.statusText };
+        }
+        const json = await res.json();
+        return { success: true, data: json };
+      } catch (err) {
+        return { errorStatus: 999, errorText: err.message };
+      }
+    }, panApiUrl);
+  } catch (err) {
+    throw new Error(`Browser context page evaluate failed: ${err.message}`);
+  }
+
+  if (!panApiResponse) {
+    throw new Error("No response returned from browser evaluate context.");
+  }
+
+  if (panApiResponse.errorStatus) {
+    if (panApiResponse.errorStatus === 429 || panApiResponse.errorStatus === 403) {
+      throw new Error('RATE_LIMIT_TRIGGERED');
+    }
+    throw new Error(`API returned HTTP ${panApiResponse.errorStatus}: ${panApiResponse.errorText}`);
+  }
+
+  const apiData = panApiResponse.data || {};
+  
+  // Strict stateless correctness check: ensure returned data matches queried PAN exactly
+  const returnedPan = String(apiData.pan || '').trim().toUpperCase();
+  if (returnedPan !== cleanPan) {
+    throw new Error(`Stateless accuracy mismatch! Expected PAN ${cleanPan} but API returned ${returnedPan}`);
+  }
+
+  const items = apiData.items || [];
+  const count = apiData.count || 0;
+
+  if (count === 0 || items.length === 0) {
+    logCallback(`[INFO] No GST registration associated with PAN: ${cleanPan}`);
+    return {
+      gstin: 'N/A',
+      businessName: 'No Business Registered',
+      gstStatus: 'N/A',
+      scrapeStatus: 'No GST Associated',
+      gstDetailsList: []
+    };
+  }
+
+  // Map items to standard format expected by writeExcel: [{ gstin, status }]
+  const gstDetailsList = items.map(item => {
+    let status = 'Active';
+    if (item.auth_status) {
+      const lower = item.auth_status.toLowerCase();
+      if (lower.includes('inactive')) status = 'Inactive';
+      else if (lower.includes('cancelled')) status = 'Cancelled';
+      else if (lower.includes('suspended')) status = 'Suspended';
+      else if (lower.includes('pending')) status = 'Pending';
+      else status = item.auth_status.charAt(0).toUpperCase() + item.auth_status.slice(1);
+    }
+    return {
+      gstin: String(item.gstin || '').trim().toUpperCase(),
+      status: status
+    };
+  });
+
+  const uniqueGstins = gstDetailsList.map(item => item.gstin);
+
+  // Take the first Active GSTIN to fetch business enrichment legal name
+  const firstActiveItem = gstDetailsList.find(item => item.status === 'Active') || gstDetailsList[0];
+  const targetGstin = firstActiveItem.gstin;
+
+  logCallback(`Found ${gstDetailsList.length} GSTIN(s). Querying enrichment details for: ${targetGstin}...`);
+  const gstinApiUrl = `https://razorpay.com/api/gstin/${targetGstin}`;
+
+  let gstinApiResponse;
+  try {
+    gstinApiResponse = await page.evaluate(async (url) => {
+      try {
+        const res = await fetch(url);
+        if (res.status === 429) {
+          return { errorStatus: 429 };
+        }
+        if (!res.ok) {
+          return { errorStatus: res.status, errorText: res.statusText };
+        }
+        const json = await res.json();
+        return { success: true, data: json };
+      } catch (err) {
+        return { errorStatus: 999, errorText: err.message };
+      }
+    }, gstinApiUrl);
+  } catch (err) {
+    throw new Error(`Browser context evaluate for GSTIN failed: ${err.message}`);
+  }
+
+  if (gstinApiResponse && gstinApiResponse.errorStatus) {
+    if (gstinApiResponse.errorStatus === 429 || gstinApiResponse.errorStatus === 403) {
+      throw new Error('RATE_LIMIT_TRIGGERED');
+    }
+    logCallback(`[WARNING] Enrichment API failed (HTTP ${gstinApiResponse.errorStatus}: ${gstinApiResponse.errorText}). Using fallback legal name.`);
+  }
+
+  // Parse legal business name or trade name from enrichment JSON structure
+  let businessName = 'Registered Entity';
+  try {
+    const details = gstinApiResponse?.data?.enrichment_details?.online_provider?.details;
+    if (details?.legal_name?.value) {
+      businessName = String(details.legal_name.value).replace(/\s+/g, ' ').trim();
+    } else if (details?.trade_name?.value) {
+      businessName = String(details.trade_name.value).replace(/\s+/g, ' ').trim();
+    }
+  } catch (e) {
+    logCallback(`[WARNING] Failed to parse legal name from JSON structure. Using default fallback.`);
+  }
+
+  const gstStatus = firstActiveItem.status;
+  logCallback(`[SUCCESS] Found ${uniqueGstins.length} GSTIN(s) for ${cleanPan}: ${uniqueGstins.join(', ')} (${businessName})`);
+
+  return {
+    gstin: uniqueGstins.join(', '),
+    businessName: businessName,
+    gstStatus: gstStatus,
+    scrapeStatus: 'Success',
+    gstDetailsList: gstDetailsList
+  };
 }
 
 /**
- * Bulk scrapes an array of PAN numbers using high-speed parallel worker tabs.
+ * Bulk scrapes an array of PAN numbers using high-speed parallel API fetches.
  * @param {Array} pans List of PAN numbers
  * @param {function} progressCallback Callback to stream live progress percentage and log strings
  * @param {boolean} headless Whether to run browser headlessly
@@ -439,6 +220,24 @@ async function scrapeBulkPans(pans, progressCallback, headless = true, concurren
       await p.evaluateOnNewDocument(() => {
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
       });
+      
+      // Request interception to block ads, tracking analytics, and heavy fonts/images
+      await p.setRequestInterception(true);
+      p.on('request', request => {
+        const url = request.url();
+        const resourceType = request.resourceType();
+        const blockDomains = [
+          'google-analytics.com', 'analytics.google.com', 'googletagmanager.com',
+          'googleads', 'doubleclick', 'facebook.net', 'facebook.com',
+          'segment.io', 'segment.com', 'sentry.io', 'lumberjack',
+          'ads.linkedin.com', 'adroll.com'
+        ];
+        if (blockDomains.some(d => url.includes(d)) || ['image', 'media', 'font'].includes(resourceType)) {
+          request.abort();
+        } else {
+          request.continue();
+        }
+      });
     };
 
     await initPage(page);
@@ -456,8 +255,8 @@ async function scrapeBulkPans(pans, progressCallback, headless = true, concurren
         continue;
       }
 
-      // Session recycling: recreate page every 50 PANs to manage memory and session cookies
-      if (processedCount > 0 && processedCount % 50 === 0) {
+      // Tab recycling: recreate page tab every 150 requests to keep browser state absolutely clean and avoid memory drift
+      if (processedCount > 0 && processedCount % 150 === 0) {
         progressCallback(
           Math.round((completedCount / total) * 100),
           `[Worker-${workerId}] Recycling page tab session to maintain clean state...`
@@ -476,24 +275,66 @@ async function scrapeBulkPans(pans, progressCallback, headless = true, concurren
       );
 
       let panResult = null;
-      let retries = 2; // Retry up to 2 times on failures
+      let retries = 5; // Retry up to 5 times (6 attempts total) to guarantee successful scraping!
 
       while (retries >= 0) {
         try {
           panResult = await scrapePanDetails(page, pan, (msg) => {
             progressCallback(currentProgress, `[Worker-${workerId}] ${msg}`);
           });
-
-          // If blocked by CAPTCHA, trigger immediate session recycling for next item
-          if (panResult.scrapeStatus === 'CAPTCHA Triggered') {
-            progressCallback(
-              currentProgress,
-              `[Worker-${workerId}] [WARNING] Blocked by CAPTCHA. Flagging for session recycle...`
-            );
-            processedCount = 50; 
-          }
           break;
         } catch (error) {
+          if (error.message === 'RATE_LIMIT_TRIGGERED') {
+            retries--;
+            if (retries >= 0) {
+              // Progressive backoff delay: 5s, 10s, 15s, 20s, 25s
+              const sleepTime = (5 - retries) * 5000;
+              progressCallback(
+                currentProgress,
+                `[Worker-${workerId}] [RATE LIMIT / 403 / 429] Session block triggered for ${pan}. Backing off for ${sleepTime / 1000}s, recycling session, and retrying (Attempts left: ${retries + 1})...`
+              );
+              
+              try {
+                await page.close();
+              } catch (e) {}
+              await new Promise(resolve => setTimeout(resolve, sleepTime));
+              page = await browser.newPage();
+              await initPage(page);
+              continue;
+            } else {
+              // Emergency Final Deep-Clean Retry: Sleep 45 seconds to guarantee cooling down, then attempt once more
+              progressCallback(
+                currentProgress,
+                `[Worker-${workerId}] [WARNING] Standard retries exhausted for ${pan}. Performing emergency 45-second deep backoff to clear any security locks...`
+              );
+              try {
+                try {
+                  await page.close();
+                } catch (e) {}
+                await new Promise(resolve => setTimeout(resolve, 45000));
+                page = await browser.newPage();
+                await initPage(page);
+                panResult = await scrapePanDetails(page, pan, (msg) => {
+                  progressCallback(currentProgress, `[Worker-${workerId}] [EMERGENCY RETRY] ${msg}`);
+                });
+                break;
+              } catch (finalErr) {
+                progressCallback(
+                  currentProgress,
+                  `[Worker-${workerId}] [FATAL] Emergency final attempt failed for ${pan}: ${finalErr.message}`
+                );
+                panResult = {
+                  gstin: 'N/A',
+                  businessName: 'N/A',
+                  gstStatus: 'N/A',
+                  scrapeStatus: `Failed: Rate Limit Exceeded`,
+                  gstDetailsList: []
+                };
+                break;
+              }
+            }
+          }
+
           progressCallback(
             currentProgress,
             `[Worker-${workerId}] [ERROR] Attempt failed for ${pan}: ${error.message}. Retries left: ${retries}`
@@ -501,20 +342,44 @@ async function scrapeBulkPans(pans, progressCallback, headless = true, concurren
           retries--;
           
           if (retries >= 0) {
-            // Re-create the page tab to heal the session
             try {
               await page.close();
             } catch (e) {}
             page = await browser.newPage();
             await initPage(page);
-            await new Promise(resolve => setTimeout(resolve, 3000));
+            // Progressive backoff delay for general errors as well
+            const sleepTime = (5 - retries) * 5000;
+            await new Promise(resolve => setTimeout(resolve, sleepTime));
           } else {
-            panResult = {
-              gstin: 'N/A',
-              businessName: 'N/A',
-              gstStatus: 'N/A',
-              scrapeStatus: `Failed: ${error.message}`
-            };
+            // Emergency Final Deep-Clean Retry for general errors
+            progressCallback(
+              currentProgress,
+              `[Worker-${workerId}] [WARNING] Standard retries exhausted for general error on ${pan}. Performing emergency 45-second deep backoff to clear any network blocks...`
+            );
+            try {
+              try {
+                await page.close();
+              } catch (e) {}
+              await new Promise(resolve => setTimeout(resolve, 45000));
+              page = await browser.newPage();
+              await initPage(page);
+              panResult = await scrapePanDetails(page, pan, (msg) => {
+                progressCallback(currentProgress, `[Worker-${workerId}] [EMERGENCY RETRY] ${msg}`);
+              });
+              break;
+            } catch (finalErr) {
+              progressCallback(
+                currentProgress,
+                `[Worker-${workerId}] [FATAL] Emergency final attempt failed for general error on ${pan}: ${finalErr.message}`
+              );
+              panResult = {
+                gstin: 'N/A',
+                businessName: 'N/A',
+                gstStatus: 'N/A',
+                scrapeStatus: `Failed: ${error.message}`,
+                gstDetailsList: []
+              };
+            }
           }
         }
       }
@@ -523,16 +388,15 @@ async function scrapeBulkPans(pans, progressCallback, headless = true, concurren
       completedCount++;
       processedCount++;
 
-      // Progress reporting
       const finalProgress = Math.round((completedCount / total) * 100);
       progressCallback(
         finalProgress,
         `[Worker-${workerId}] Completed item ${pan}. Total completed: ${completedCount}/${total}`
       );
 
-      // Add a polite human-like delay between searches
+      // Add a polite human-like delay between searches to prevent triggering rate limits
       if (queue.length > 0) {
-        const delay = Math.floor(Math.random() * 1500) + 1500; // 1.5s to 3s
+        const delay = Math.floor(Math.random() * 1000) + 2000; // 2s to 3s (average 2.5s)
         await new Promise(resolve => setTimeout(resolve, delay));
       }
     }
@@ -571,4 +435,3 @@ async function scrapeBulkPans(pans, progressCallback, headless = true, concurren
 export {
   scrapeBulkPans
 };
-
